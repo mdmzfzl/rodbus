@@ -11,6 +11,7 @@ use crate::server::task::{AuthorizationType, ServerCommand};
 use crate::server::AddressFilter;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "enable-tls")]
 use crate::server::AuthorizationHandler;
@@ -106,12 +107,14 @@ pub(crate) struct ServerTask<T: RequestHandler> {
     decode: DecodeLevel,
     tx: tokio::sync::mpsc::Sender<SessionClose>,
     rx: tokio::sync::mpsc::Receiver<SessionClose>,
+    shutdown: CancellationToken,
 }
 
 impl<T> ServerTask<T>
 where
     T: RequestHandler,
 {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         max_sessions: usize,
         listener: TcpListener,
@@ -119,6 +122,7 @@ where
         connection_handler: TcpServerConnectionHandler,
         filter: AddressFilter,
         decode: DecodeLevel,
+        shutdown: CancellationToken,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
 
@@ -131,6 +135,7 @@ where
             decode,
             tx,
             rx,
+            shutdown,
         }
     }
 
@@ -141,8 +146,6 @@ where
                 tracing::info!("changed decoding level to {:?}", level);
                 self.decode = level;
             }
-            // handled by the caller, which returns instead of forwarding it to the sessions
-            ServerCommand::Shutdown => return,
         }
 
         for sender in self.tracker.sessions.values_mut() {
@@ -153,15 +156,24 @@ where
     }
 
     pub(crate) async fn run(&mut self, mut commands: tokio::sync::mpsc::Receiver<ServerCommand>) {
+        // the clone releases the borrow of self that run_inner() needs mutably
+        let shutdown = self.shutdown.clone();
+        tokio::select! {
+            // biased so that a cancelled task cannot be given another poll of run_inner(), which
+            // would let it accept another connection before noticing the shutdown
+            biased;
+            _ = shutdown.cancelled() => {
+                tracing::info!("server shutdown requested");
+            }
+            _ = self.run_inner(&mut commands) => {}
+        }
+    }
+
+    async fn run_inner(&mut self, commands: &mut tokio::sync::mpsc::Receiver<ServerCommand>) {
         loop {
             tokio::select! {
                command = commands.recv() => {
                     match command {
-                        // dropping the tracker ends every session, just as dropping the handle does
-                        Some(ServerCommand::Shutdown) => {
-                            tracing::info!("server shutdown requested");
-                            return;
-                        }
                         Some(command) => self.apply_command(command).await,
                         None => {
                             tracing::info!("server shutdown");
@@ -211,17 +223,23 @@ where
         let connection_handler = self.connection_handler.clone();
         let handler_map = self.handlers.clone();
         let decode_level = self.decode;
+        // sessions are spawned and never joined, so they need the signal directly: the server task
+        // returning only drops their command sender, which they would not notice mid-write
+        let shutdown = self.shutdown.clone();
 
         let session = async move {
-            run_session(
-                socket,
-                addr,
-                connection_handler,
-                decode_level,
-                handler_map,
-                rx,
-            )
-            .await;
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {}
+                _ = run_session(
+                    socket,
+                    addr,
+                    connection_handler,
+                    decode_level,
+                    handler_map,
+                    rx,
+                ) => {}
+            }
 
             // no matter what happens, we send the id back to the server
             let _ = notify_close.send(SessionClose(id)).await;
@@ -267,17 +285,27 @@ async fn run_session<T: RequestHandler>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::Shutdown;
     use crate::server::create_tcp_server_task;
     use crate::UnitId;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Bounds how long a test will hang if shutdown stops being immediate
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     struct DefaultHandler;
     impl RequestHandler for DefaultHandler {}
 
-    #[tokio::test]
-    async fn task_ends_when_shutdown_requested_with_the_handle_still_alive() {
-        // bound but never connected to: shutdown is a queued command, not something on the wire
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    fn spawn_server() -> (
+        crate::server::ServerHandle,
+        tokio::task::JoinHandle<()>,
+        SocketAddr,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener = TcpListener::from_std(listener).unwrap();
+
         let (handle, task) = create_tcp_server_task(
             1,
             listener,
@@ -285,12 +313,56 @@ mod tests {
             AddressFilter::Any,
             DecodeLevel::nothing(),
         );
-        let task = tokio::spawn(task.run());
 
-        handle.shutdown().await.unwrap();
-        task.await.unwrap();
+        (handle, tokio::spawn(task.run()), addr)
+    }
 
-        // the handle outlived the task it terminated, and now reports that it is gone
-        assert_eq!(handle.shutdown().await, Err(Shutdown));
+    #[tokio::test]
+    async fn task_ends_when_shutdown_requested_with_the_handle_still_alive() {
+        let (handle, task, _addr) = spawn_server();
+
+        handle.shutdown();
+        tokio::time::timeout(TEST_TIMEOUT, task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // the handle outlived the task it terminated
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn shutdown_terminates_an_established_session() {
+        let (handle, task, addr) = spawn_server();
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // exchanging a frame proves the session task is running before we shut it down; otherwise
+        // the connection could still be sitting in the accept queue and the EOF below would only
+        // show that the listener closed. The default handler answers with an exception, which is
+        // all we need here -- the reply's contents are irrelevant.
+        let read_coils = [0u8, 1, 0, 0, 0, 6, 1, 1, 0, 7, 0, 2];
+        client.write_all(&read_coils).await.unwrap();
+        let mut response = [0u8; 32];
+        let replied = tokio::time::timeout(TEST_TIMEOUT, client.read(&mut response))
+            .await
+            .expect("the server never answered, so the session was not established")
+            .unwrap();
+        assert!(replied > 0);
+
+        handle.shutdown();
+
+        // the session drops its socket, which the peer observes as EOF
+        let mut buffer = [0u8; 8];
+        assert_eq!(
+            tokio::time::timeout(TEST_TIMEOUT, client.read(&mut buffer))
+                .await
+                .expect("shutdown did not terminate the session")
+                .unwrap(),
+            0
+        );
+        tokio::time::timeout(TEST_TIMEOUT, task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

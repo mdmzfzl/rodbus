@@ -44,6 +44,7 @@ pub(crate) fn create_tls_channel(
     listener: Box<dyn Listener<ClientState>>,
 ) -> (Channel, ClientTask) {
     let (tx, rx) = tokio::sync::mpsc::channel(options.max_queued_requests);
+    let shutdown = tokio_util::sync::CancellationToken::new();
     let task = TcpChannelTask::new(
         host,
         rx.into(),
@@ -51,8 +52,9 @@ pub(crate) fn create_tls_channel(
         connect_retry,
         options,
         listener,
+        shutdown.clone(),
     );
-    (Channel { tx }, ClientTask::tcp(task))
+    (Channel { tx, shutdown }, ClientTask::tcp(task))
 }
 
 impl TlsClientConfig {

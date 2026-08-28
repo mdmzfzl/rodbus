@@ -5,6 +5,7 @@ use tracing::Instrument;
 use crate::decode::DecodeLevel;
 use crate::server::task::ServerCommand;
 use crate::tcp::server::{ServerTask as TcpServerTask, TcpServerConnectionHandler};
+use tokio_util::sync::CancellationToken;
 
 /// server handling
 mod address_filter;
@@ -29,19 +30,22 @@ pub use crate::tcp::tls::server::TlsServerConfig;
 #[cfg(feature = "enable-tls")]
 pub use crate::tcp::tls::*;
 
-/// Handle to the server async task. The associated task is shutdown when every handle is dropped
-/// or [`ServerHandle::shutdown`] is called.
+/// Handle to the server async task.
+///
+/// The associated task terminates when the handle is dropped, or immediately when
+/// [`ServerHandle::shutdown`] is called.
 #[derive(Debug)]
 pub struct ServerHandle {
     tx: tokio::sync::mpsc::Sender<ServerCommand>,
+    shutdown: CancellationToken,
 }
 
 /// A server task that has been created but not yet spawned.
 ///
 /// This is returned, alongside its [`ServerHandle`], by the `create_*_server_task` functions.
 /// Drive it to completion by awaiting [`ServerTask::run`], typically from within
-/// [`tokio::spawn`]. The task completes when every associated [`ServerHandle`] is dropped or
-/// [`ServerHandle::shutdown`] is called.
+/// [`tokio::spawn`]. The task completes when the associated [`ServerHandle`] is dropped, or
+/// immediately when [`ServerHandle::shutdown`] is called.
 ///
 /// Unlike the `spawn_*_server_task` functions, no tracing span is attached to the task, so the
 /// caller is free to wrap [`run`](ServerTask::run) with their own instrumentation.
@@ -72,7 +76,7 @@ impl<T: RequestHandler> ServerTask<T> {
         }
     }
 
-    /// Run the server task until every [`ServerHandle`] is dropped or
+    /// Run the server task until the associated [`ServerHandle`] is dropped, or
     /// [`ServerHandle::shutdown`] is called.
     pub async fn run(self) {
         match self.inner {
@@ -89,8 +93,8 @@ impl ServerHandle {
     /// Construct a [ServerHandle] from its fields
     ///
     /// This function is only required for the C bindings
-    pub fn new(tx: tokio::sync::mpsc::Sender<ServerCommand>) -> Self {
-        ServerHandle { tx }
+    pub fn new(tx: tokio::sync::mpsc::Sender<ServerCommand>, shutdown: CancellationToken) -> Self {
+        ServerHandle { tx, shutdown }
     }
 
     /// Change the decoding level for future sessions and all active sessions
@@ -99,12 +103,15 @@ impl ServerHandle {
         Ok(())
     }
 
-    /// Begin shutting down the server task, even if one or more [`ServerHandle`]s are still alive
+    /// Shut down the server task and every active session immediately
     ///
-    /// The task completes when it processes the command, which may be after this returns
-    pub async fn shutdown(&self) -> Result<(), Shutdown> {
-        self.tx.send(ServerCommand::Shutdown).await?;
-        Ok(())
+    /// Unlike dropping the handle, this does not wait for sessions to reach a quiescent point. The
+    /// listener stops accepting and each session is cancelled at its next suspension point, so a
+    /// response that is partially written is abandoned.
+    ///
+    /// Calling this more than once, or after the task has already terminated, has no effect.
+    pub fn shutdown(&self) {
+        self.shutdown.cancel();
     }
 }
 
@@ -156,6 +163,7 @@ pub fn create_tcp_server_task<T: RequestHandler>(
     decode: DecodeLevel,
 ) -> (ServerHandle, ServerTask<T>) {
     let (tx, rx) = tokio::sync::mpsc::channel(SERVER_COMMAND_CHANNEL_CAPACITY);
+    let shutdown = CancellationToken::new();
     let task = TcpServerTask::new(
         max_sessions,
         listener,
@@ -163,9 +171,10 @@ pub fn create_tcp_server_task<T: RequestHandler>(
         TcpServerConnectionHandler::Tcp,
         filter,
         decode,
+        shutdown.clone(),
     );
 
-    (ServerHandle::new(tx), ServerTask::tcp(task, rx))
+    (ServerHandle::new(tx, shutdown), ServerTask::tcp(task, rx))
 }
 
 /// Spawns a RTU server task onto the runtime.
@@ -215,6 +224,7 @@ pub fn create_rtu_server_task<T: RequestHandler>(
     decode: DecodeLevel,
 ) -> (ServerHandle, ServerTask<T>) {
     let (tx, rx) = tokio::sync::mpsc::channel(SERVER_COMMAND_CHANNEL_CAPACITY);
+    let shutdown = CancellationToken::new();
     let session = crate::server::task::SessionTask::new(
         handlers,
         crate::server::task::AuthorizationType::None,
@@ -229,9 +239,10 @@ pub fn create_rtu_server_task<T: RequestHandler>(
         retry,
         settings,
         session,
+        shutdown: shutdown.clone(),
     };
 
-    (ServerHandle::new(tx), ServerTask::rtu(rtu))
+    (ServerHandle::new(tx, shutdown), ServerTask::rtu(rtu))
 }
 
 /// Spawns a "raw" TLS server task onto the runtime. This TLS server does NOT require that
@@ -413,6 +424,7 @@ fn create_tls_server_task_impl<T: RequestHandler>(
     decode: DecodeLevel,
 ) -> (ServerHandle, ServerTask<T>) {
     let (tx, rx) = tokio::sync::mpsc::channel(SERVER_COMMAND_CHANNEL_CAPACITY);
+    let shutdown = CancellationToken::new();
     let task = TcpServerTask::new(
         max_sessions,
         listener,
@@ -420,7 +432,8 @@ fn create_tls_server_task_impl<T: RequestHandler>(
         TcpServerConnectionHandler::Tls(tls_config, auth_handler),
         filter,
         decode,
+        shutdown.clone(),
     );
 
-    (ServerHandle::new(tx), ServerTask::tcp(task, rx))
+    (ServerHandle::new(tx, shutdown), ServerTask::tcp(task, rx))
 }

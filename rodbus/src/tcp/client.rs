@@ -11,6 +11,7 @@ use crate::retry::RetryStrategy;
 use crate::{ChannelLoggingMode, ClientOptions};
 
 use tokio::net::TcpStream;
+use tokio_util::sync::CancellationToken;
 
 macro_rules! log_channel_event {
     ($channel_logging:expr, $($arg:tt)*) => {
@@ -44,6 +45,7 @@ pub(crate) fn create_tcp_channel(
     options: ClientOptions,
 ) -> (Channel, ClientTask) {
     let (tx, rx) = tokio::sync::mpsc::channel(options.max_queued_requests);
+    let shutdown = CancellationToken::new();
     let task = TcpChannelTask::new(
         host,
         rx.into(),
@@ -51,8 +53,9 @@ pub(crate) fn create_tcp_channel(
         connect_retry,
         options,
         listener,
+        shutdown.clone(),
     );
-    (Channel { tx }, ClientTask::tcp(task))
+    (Channel { tx, shutdown }, ClientTask::tcp(task))
 }
 
 pub(crate) enum TcpTaskConnectionHandler {
@@ -82,6 +85,7 @@ pub(crate) struct TcpChannelTask {
     client_loop: ClientLoop,
     listener: Box<dyn Listener<ClientState>>,
     channel_logging: ChannelLoggingMode,
+    shutdown: CancellationToken,
 }
 
 impl TcpChannelTask {
@@ -92,6 +96,7 @@ impl TcpChannelTask {
         connect_retry: Box<dyn RetryStrategy>,
         options: ClientOptions,
         listener: Box<dyn Listener<ClientState>>,
+        shutdown: CancellationToken,
     ) -> Self {
         Self {
             host,
@@ -106,15 +111,25 @@ impl TcpChannelTask {
             ),
             listener,
             channel_logging: options.channel_logging,
+            shutdown,
         }
     }
 
     // runs until it is shut down
     pub(crate) async fn run(&mut self) -> Shutdown {
         self.listener.update(ClientState::Disabled).get().await;
-        let ret = self.run_inner().await;
+        // the clone releases the borrow of self that run_inner() needs mutably
+        let shutdown = self.shutdown.clone();
+        tokio::select! {
+            // biased so that a cancelled task cannot be given another poll of run_inner(), which
+            // would let it finish work that is already ready before noticing the shutdown
+            biased;
+            _ = shutdown.cancelled() => {}
+            _ = self.run_inner() => {}
+        }
+        // outside the select so that a cancelled task still reports its terminal state
         self.listener.update(ClientState::Shutdown).get().await;
-        ret
+        Shutdown
     }
 
     async fn run_inner(&mut self) -> Shutdown {
@@ -209,9 +224,20 @@ impl TcpChannelTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::RequestParam;
     use crate::maybe_async::MaybeAsync;
     use crate::retry::default_retry_strategy;
+    use crate::{AddressRange, RequestError, RetryStrategy, UnitId};
     use std::net::Ipv4Addr;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A request timeout long enough that any test which observes a request completing before it
+    /// elapses has necessarily observed cancellation rather than a timeout
+    const NEVER: Duration = Duration::from_secs(3600);
+
+    /// Bounds how long a test will hang if shutdown stops being immediate
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     struct StateRecorder {
         tx: tokio::sync::mpsc::UnboundedSender<ClientState>,
@@ -221,6 +247,20 @@ mod tests {
         fn update(&mut self, value: ClientState) -> MaybeAsync<()> {
             let _ = self.tx.send(value);
             MaybeAsync::ready(())
+        }
+    }
+
+    struct NeverRetry;
+
+    impl RetryStrategy for NeverRetry {
+        fn reset(&mut self) {}
+
+        fn after_failed_connect(&mut self) -> Duration {
+            NEVER
+        }
+
+        fn after_disconnect(&mut self) -> Duration {
+            NEVER
         }
     }
 
@@ -236,11 +276,157 @@ mod tests {
         );
         let task = tokio::spawn(task.run());
 
-        channel.shutdown().await.unwrap();
-        task.await.unwrap();
+        channel.shutdown();
+        tokio::time::timeout(TEST_TIMEOUT, task)
+            .await
+            .unwrap()
+            .unwrap();
 
         // the task announced its own termination on the way out
         assert_eq!(states.recv().await, Some(ClientState::Disabled));
         assert_eq!(states.recv().await, Some(ClientState::Shutdown));
+    }
+
+    #[tokio::test]
+    async fn shutdown_abandons_the_request_in_flight() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (channel, task) = create_tcp_channel(
+            HostAddr::ip(addr.ip(), addr.port()),
+            default_retry_strategy(),
+            crate::client::NullListener::create(),
+            ClientOptions::default(),
+        );
+        let task = tokio::spawn(task.run());
+        channel.enable().await.unwrap();
+
+        // accept the connection and read the request, but never answer it
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let requester = channel.clone();
+        let coils = tokio::spawn(async move {
+            requester
+                .read_coils(
+                    RequestParam::new(UnitId::new(1), NEVER),
+                    AddressRange::try_from(7, 2).unwrap(),
+                )
+                .await
+        });
+        let mut buffer = [0u8; 32];
+        let read = socket.read(&mut buffer).await.unwrap();
+        assert!(read > 0, "the request never reached the wire");
+
+        // the loop is now parked awaiting a response that will never arrive
+        channel.shutdown();
+
+        assert_eq!(
+            tokio::time::timeout(TEST_TIMEOUT, coils)
+                .await
+                .expect("shutdown did not abandon the in-flight request")
+                .unwrap(),
+            Err(RequestError::Shutdown)
+        );
+        tokio::time::timeout(TEST_TIMEOUT, task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // the peer sees the connection go away rather than a lingering half-open socket
+        assert_eq!(socket.read(&mut buffer).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_the_wait_before_reconnecting() {
+        // bind and immediately drop, so connecting fails and the task enters its retry delay
+        let addr = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+
+        let (tx, mut states) = tokio::sync::mpsc::unbounded_channel();
+        let (channel, task) = create_tcp_channel(
+            HostAddr::ip(addr.ip(), addr.port()),
+            Box::new(NeverRetry),
+            Box::new(StateRecorder { tx }),
+            ClientOptions::default(),
+        );
+        let task = tokio::spawn(task.run());
+        channel.enable().await.unwrap();
+
+        // wait until the task is actually sleeping on the retry delay
+        loop {
+            match states.recv().await.unwrap() {
+                ClientState::WaitAfterFailedConnect(delay) => {
+                    assert_eq!(delay, NEVER);
+                    break;
+                }
+                _ => continue,
+            }
+        }
+
+        channel.shutdown();
+
+        tokio::time::timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("shutdown did not interrupt the retry delay")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_requests_fail_when_shutdown_is_requested() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (channel, task) = create_tcp_channel(
+            HostAddr::ip(addr.ip(), addr.port()),
+            default_retry_strategy(),
+            crate::client::NullListener::create(),
+            ClientOptions::default(),
+        );
+        let task = tokio::spawn(task.run());
+        channel.enable().await.unwrap();
+
+        let (mut socket, _) = listener.accept().await.unwrap();
+
+        // one request occupies the loop, the rest sit in the queue behind it
+        let queued: Vec<_> = (0..4)
+            .map(|_| {
+                let requester = channel.clone();
+                tokio::spawn(async move {
+                    requester
+                        .read_coils(
+                            RequestParam::new(UnitId::new(1), NEVER),
+                            AddressRange::try_from(7, 2).unwrap(),
+                        )
+                        .await
+                })
+            })
+            .collect();
+
+        let mut buffer = [0u8; 32];
+        assert!(socket.read(&mut buffer).await.unwrap() > 0);
+
+        channel.shutdown();
+
+        // every request fails, in flight or queued, without waiting out a single timeout
+        for handle in queued {
+            assert_eq!(
+                tokio::time::timeout(TEST_TIMEOUT, handle)
+                    .await
+                    .expect("a queued request was left waiting")
+                    .unwrap(),
+                Err(RequestError::Shutdown)
+            );
+        }
+        tokio::time::timeout(TEST_TIMEOUT, task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // the handle outlives the task it terminated
+        channel.shutdown();
+        assert_eq!(channel.enable().await, Err(crate::error::Shutdown));
+
+        drop(socket.write(&[]).await);
     }
 }

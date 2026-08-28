@@ -8,20 +8,24 @@ use crate::client::requests::write_single::SingleWrite;
 use crate::error::*;
 use crate::types::{AddressRange, BitIterator, Indexed, RegisterIterator, UnitId};
 use crate::DecodeLevel;
+use tokio_util::sync::CancellationToken;
 
-/// Async channel used to make requests. The associated task is shutdown when every handle is
-/// dropped or [`Channel::shutdown`] is called.
+/// Async channel used to make requests.
+///
+/// The associated task terminates when every handle is dropped, or immediately when
+/// [`Channel::shutdown`] is called.
 #[derive(Debug, Clone)]
 pub struct Channel {
     pub(crate) tx: tokio::sync::mpsc::Sender<Command>,
+    pub(crate) shutdown: CancellationToken,
 }
 
 /// A client channel task that has been created but not yet spawned.
 ///
 /// This is returned, alongside its [`Channel`] handle, by the `create_*_client_task` functions.
 /// Drive it to completion by awaiting [`ClientTask::run`], typically from within
-/// [`tokio::spawn`]. The task completes when every associated [`Channel`] handle is dropped or
-/// [`Channel::shutdown`] is called.
+/// [`tokio::spawn`]. The task completes when every associated [`Channel`] handle is dropped, or
+/// immediately when [`Channel::shutdown`] is called.
 ///
 /// Unlike the `spawn_*_client_task` functions, no tracing span is attached to the task, so the
 /// caller is free to wrap [`run`](ClientTask::run) with their own instrumentation.
@@ -49,7 +53,7 @@ impl ClientTask {
         }
     }
 
-    /// Run the channel task until every [`Channel`] handle is dropped or [`Channel::shutdown`] is
+    /// Run the channel task until every [`Channel`] handle is dropped, or [`Channel::shutdown`] is
     /// called.
     pub async fn run(self) {
         match self.inner {
@@ -124,6 +128,7 @@ impl Channel {
         listener: Option<Box<dyn crate::client::Listener<crate::client::PortState>>>,
     ) -> (Self, ClientTask) {
         let (tx, rx) = tokio::sync::mpsc::channel(max_queued_requests);
+        let shutdown = CancellationToken::new();
         let task = crate::serial::client::SerialChannelTask::new(
             path,
             serial_settings,
@@ -131,8 +136,9 @@ impl Channel {
             retry,
             decode,
             listener.unwrap_or_else(|| crate::client::NullListener::create()),
+            shutdown.clone(),
         );
-        (Channel { tx }, ClientTask::serial(task))
+        (Channel { tx, shutdown }, ClientTask::serial(task))
     }
 
     /// Enable communications
@@ -147,12 +153,16 @@ impl Channel {
         Ok(())
     }
 
-    /// Begin shutting down the channel task, even if one or more [`Channel`] handles are still alive
+    /// Shut down the channel task immediately, even if other [`Channel`] handles are still alive
     ///
-    /// The task completes when it processes the command, which may be after this returns
-    pub async fn shutdown(&self) -> Result<(), Shutdown> {
-        self.tx.send(Command::Shutdown).await?;
-        Ok(())
+    /// Unlike dropping every handle, this does not wait for queued work. The task is cancelled at
+    /// its next suspension point, so a request already on the wire is abandoned rather than awaited
+    /// and every queued request fails with [`RequestError::Shutdown`]. A write that was already
+    /// transmitted may still be applied by the server, so its outcome is indeterminate.
+    ///
+    /// Calling this more than once, or after the task has already terminated, has no effect.
+    pub fn shutdown(&self) {
+        self.shutdown.cancel();
     }
 
     /// Read coils from the server

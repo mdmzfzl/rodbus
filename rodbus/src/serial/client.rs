@@ -7,6 +7,7 @@ use crate::client::task::{ClientLoop, SessionError, StateChange};
 use crate::client::{Listener, PortState, RetryStrategy};
 use crate::common::frame::{FrameWriter, FramedReader};
 use crate::error::Shutdown;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) struct SerialChannelTask {
     path: String,
@@ -14,9 +15,11 @@ pub(crate) struct SerialChannelTask {
     retry: Box<dyn RetryStrategy>,
     client_loop: ClientLoop,
     listener: Box<dyn Listener<PortState>>,
+    shutdown: CancellationToken,
 }
 
 impl SerialChannelTask {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         path: &str,
         serial_settings: SerialSettings,
@@ -24,6 +27,7 @@ impl SerialChannelTask {
         retry: Box<dyn RetryStrategy>,
         decode: DecodeLevel,
         listener: Box<dyn Listener<PortState>>,
+        shutdown: CancellationToken,
     ) -> Self {
         Self {
             path: path.to_string(),
@@ -37,14 +41,24 @@ impl SerialChannelTask {
                 None,
             ),
             listener,
+            shutdown,
         }
     }
 
     pub(crate) async fn run(&mut self) -> Shutdown {
         self.listener.update(PortState::Disabled).get().await;
-        let ret = self.run_inner().await;
+        // the clone releases the borrow of self that run_inner() needs mutably
+        let shutdown = self.shutdown.clone();
+        tokio::select! {
+            // biased so that a cancelled task cannot be given another poll of run_inner(), which
+            // would let it finish work that is already ready before noticing the shutdown
+            biased;
+            _ = shutdown.cancelled() => {}
+            _ = self.run_inner() => {}
+        }
+        // outside the select so that a cancelled task still reports its terminal state
         self.listener.update(PortState::Shutdown).get().await;
-        ret
+        Shutdown
     }
 
     async fn run_inner(&mut self) -> Shutdown {
