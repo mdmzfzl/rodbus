@@ -158,6 +158,10 @@ impl ClientLoop {
         self.enabled
     }
 
+    pub(crate) async fn shutdown(&mut self) {
+        self.rx.close_and_drain().await;
+    }
+
     async fn run_cmd(&mut self, cmd: Command, io: &mut PhysLayer) -> Result<(), SessionError> {
         match cmd {
             Command::Setting(setting) => {
@@ -401,7 +405,7 @@ mod tests {
         });
         let channel = Channel {
             tx,
-            shutdown: tokio_util::sync::CancellationToken::new(),
+            shutdown: crate::common::cancellation::TaskCancellation::default(),
         };
         (channel, join_handle, io_handle)
     }

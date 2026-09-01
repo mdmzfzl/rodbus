@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use tracing::Instrument;
 
+use crate::common::cancellation::TaskCancellation;
 use crate::common::frame::{FrameWriter, FramedReader};
 use crate::common::phys::PhysLayer;
 use crate::decode::DecodeLevel;
@@ -11,7 +12,6 @@ use crate::server::task::{AuthorizationType, ServerCommand};
 use crate::server::AddressFilter;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
-use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "enable-tls")]
 use crate::server::AuthorizationHandler;
@@ -107,14 +107,13 @@ pub(crate) struct ServerTask<T: RequestHandler> {
     decode: DecodeLevel,
     tx: tokio::sync::mpsc::Sender<SessionClose>,
     rx: tokio::sync::mpsc::Receiver<SessionClose>,
-    shutdown: CancellationToken,
+    shutdown: TaskCancellation,
 }
 
 impl<T> ServerTask<T>
 where
     T: RequestHandler,
 {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         max_sessions: usize,
         listener: TcpListener,
@@ -122,7 +121,6 @@ where
         connection_handler: TcpServerConnectionHandler,
         filter: AddressFilter,
         decode: DecodeLevel,
-        shutdown: CancellationToken,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
 
@@ -135,8 +133,12 @@ where
             decode,
             tx,
             rx,
-            shutdown,
+            shutdown: TaskCancellation::default(),
         }
+    }
+
+    pub(crate) fn cancellation(&self) -> TaskCancellation {
+        self.shutdown.clone()
     }
 
     async fn apply_command(&mut self, command: ServerCommand) {
@@ -156,16 +158,13 @@ where
     }
 
     pub(crate) async fn run(&mut self, mut commands: tokio::sync::mpsc::Receiver<ServerCommand>) {
-        // the clone releases the borrow of self that run_inner() needs mutably
         let shutdown = self.shutdown.clone();
-        tokio::select! {
-            // biased so that a cancelled task cannot be given another poll of run_inner(), which
-            // would let it accept another connection before noticing the shutdown
-            biased;
-            _ = shutdown.cancelled() => {
-                tracing::info!("server shutdown requested");
-            }
-            _ = self.run_inner(&mut commands) => {}
+        if shutdown
+            .run_until_cancelled(self.run_inner(&mut commands))
+            .await
+            .is_none()
+        {
+            tracing::info!("server shutdown requested");
         }
     }
 
@@ -223,23 +222,20 @@ where
         let connection_handler = self.connection_handler.clone();
         let handler_map = self.handlers.clone();
         let decode_level = self.decode;
-        // sessions are spawned and never joined, so they need the signal directly: the server task
-        // returning only drops their command sender, which they would not notice mid-write
+        // sessions are spawned, so they need to observe cancellation directly
         let shutdown = self.shutdown.clone();
 
         let session = async move {
-            tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => {}
-                _ = run_session(
+            shutdown
+                .run_until_cancelled(run_session(
                     socket,
                     addr,
                     connection_handler,
                     decode_level,
                     handler_map,
                     rx,
-                ) => {}
-            }
+                ))
+                .await;
 
             // no matter what happens, we send the id back to the server
             let _ = notify_close.send(SessionClose(id)).await;
@@ -342,12 +338,11 @@ mod tests {
         // all we need here -- the reply's contents are irrelevant.
         let read_coils = [0u8, 1, 0, 0, 0, 6, 1, 1, 0, 7, 0, 2];
         client.write_all(&read_coils).await.unwrap();
-        let mut response = [0u8; 32];
-        let replied = tokio::time::timeout(TEST_TIMEOUT, client.read(&mut response))
+        let mut response = [0u8; 9];
+        tokio::time::timeout(TEST_TIMEOUT, client.read_exact(&mut response))
             .await
             .expect("the server never answered, so the session was not established")
             .unwrap();
-        assert!(replied > 0);
 
         handle.shutdown();
 

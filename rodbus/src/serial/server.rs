@@ -1,8 +1,8 @@
+use crate::common::cancellation::TaskCancellation;
 use crate::common::phys::PhysLayer;
 use crate::server::task::SessionTask;
 use crate::server::RequestHandler;
 use crate::{RequestError, RetryStrategy, SerialSettings, Shutdown};
-use tokio_util::sync::CancellationToken;
 
 pub(crate) struct RtuServerTask<T>
 where
@@ -12,23 +12,38 @@ where
     pub(crate) retry: Box<dyn RetryStrategy>,
     pub(crate) settings: SerialSettings,
     pub(crate) session: SessionTask<T>,
-    pub(crate) shutdown: CancellationToken,
+    shutdown: TaskCancellation,
 }
 
 impl<T> RtuServerTask<T>
 where
     T: RequestHandler,
 {
-    pub(crate) async fn run(&mut self) -> Shutdown {
-        // the clone releases the borrow of self that run_inner() needs mutably
-        let shutdown = self.shutdown.clone();
-        tokio::select! {
-            // biased so that a cancelled task cannot be given another poll of run_inner(), which
-            // would let it finish work that is already ready before noticing the shutdown
-            biased;
-            _ = shutdown.cancelled() => Shutdown,
-            res = self.run_inner() => res,
+    pub(crate) fn new(
+        port: String,
+        retry: Box<dyn RetryStrategy>,
+        settings: SerialSettings,
+        session: SessionTask<T>,
+    ) -> Self {
+        Self {
+            port,
+            retry,
+            settings,
+            session,
+            shutdown: TaskCancellation::default(),
         }
+    }
+
+    pub(crate) fn cancellation(&self) -> TaskCancellation {
+        self.shutdown.clone()
+    }
+
+    pub(crate) async fn run(&mut self) -> Shutdown {
+        let shutdown = self.shutdown.clone();
+        shutdown
+            .run_until_cancelled(self.run_inner())
+            .await
+            .unwrap_or(Shutdown)
     }
 
     async fn run_inner(&mut self) -> Shutdown {

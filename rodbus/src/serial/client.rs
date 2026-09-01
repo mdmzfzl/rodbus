@@ -5,9 +5,9 @@ use crate::serial::SerialSettings;
 use crate::client::message::Command;
 use crate::client::task::{ClientLoop, SessionError, StateChange};
 use crate::client::{Listener, PortState, RetryStrategy};
+use crate::common::cancellation::TaskCancellation;
 use crate::common::frame::{FrameWriter, FramedReader};
 use crate::error::Shutdown;
-use tokio_util::sync::CancellationToken;
 
 pub(crate) struct SerialChannelTask {
     path: String,
@@ -15,11 +15,10 @@ pub(crate) struct SerialChannelTask {
     retry: Box<dyn RetryStrategy>,
     client_loop: ClientLoop,
     listener: Box<dyn Listener<PortState>>,
-    shutdown: CancellationToken,
+    shutdown: TaskCancellation,
 }
 
 impl SerialChannelTask {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         path: &str,
         serial_settings: SerialSettings,
@@ -27,7 +26,6 @@ impl SerialChannelTask {
         retry: Box<dyn RetryStrategy>,
         decode: DecodeLevel,
         listener: Box<dyn Listener<PortState>>,
-        shutdown: CancellationToken,
     ) -> Self {
         Self {
             path: path.to_string(),
@@ -41,24 +39,28 @@ impl SerialChannelTask {
                 None,
             ),
             listener,
-            shutdown,
+            shutdown: TaskCancellation::default(),
         }
     }
 
+    pub(crate) fn cancellation(&self) -> TaskCancellation {
+        self.shutdown.clone()
+    }
+
     pub(crate) async fn run(&mut self) -> Shutdown {
-        self.listener.update(PortState::Disabled).get().await;
-        // the clone releases the borrow of self that run_inner() needs mutably
         let shutdown = self.shutdown.clone();
-        tokio::select! {
-            // biased so that a cancelled task cannot be given another poll of run_inner(), which
-            // would let it finish work that is already ready before noticing the shutdown
-            biased;
-            _ = shutdown.cancelled() => {}
-            _ = self.run_inner() => {}
-        }
-        // outside the select so that a cancelled task still reports its terminal state
+        shutdown
+            .run_until_cancelled(self.run_until_shutdown())
+            .await;
+
+        self.client_loop.shutdown().await;
         self.listener.update(PortState::Shutdown).get().await;
         Shutdown
+    }
+
+    async fn run_until_shutdown(&mut self) -> Shutdown {
+        self.listener.update(PortState::Disabled).get().await;
+        self.run_inner().await
     }
 
     async fn run_inner(&mut self) -> Shutdown {
@@ -110,5 +112,56 @@ impl SerialChannelTask {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::maybe_async::MaybeAsync;
+    use crate::retry::default_retry_strategy;
+
+    use super::*;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    struct BlockingDisabledListener {
+        states: tokio::sync::mpsc::UnboundedSender<PortState>,
+    }
+
+    impl Listener<PortState> for BlockingDisabledListener {
+        fn update(&mut self, state: PortState) -> MaybeAsync<()> {
+            self.states.send(state).unwrap();
+            match state {
+                PortState::Disabled => MaybeAsync::asynchronous(std::future::pending()),
+                _ => MaybeAsync::ready(()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_a_pending_listener_notification() {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let (states, mut state_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut task = SerialChannelTask::new(
+            "unused",
+            SerialSettings::default(),
+            rx.into(),
+            default_retry_strategy(),
+            DecodeLevel::nothing(),
+            Box::new(BlockingDisabledListener { states }),
+        );
+        let cancellation = task.cancellation();
+        let task = tokio::spawn(async move { task.run().await });
+
+        assert_eq!(state_rx.recv().await, Some(PortState::Disabled));
+        cancellation.cancel();
+
+        tokio::time::timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("shutdown did not interrupt the listener")
+            .unwrap();
+        assert_eq!(state_rx.recv().await, Some(PortState::Shutdown));
     }
 }

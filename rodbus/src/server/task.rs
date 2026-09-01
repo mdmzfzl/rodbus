@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 /// Commands that can be sent to a running server task
 #[derive(Copy, Clone)]
-pub enum ServerCommand {
+pub(crate) enum ServerCommand {
     /// Change the decoding level dynamically
     ChangeDecoding(DecodeLevel),
 }
