@@ -16,6 +16,10 @@ impl TaskCancellation {
     /// Run a future until it completes or cancellation is requested.
     ///
     /// Cancellation takes priority. When it wins, the operation is dropped before this returns.
+    ///
+    /// `CancellationToken` has a method of the same name, deliberately not used here: it polls the
+    /// operation first, so a tie goes to the operation rather than to cancellation, and it was only
+    /// added in tokio-util 0.7.12 whereas this crate depends on `0.7`.
     pub(crate) async fn run_until_cancelled<F>(&self, operation: F) -> Option<F::Output>
     where
         F: Future,

@@ -156,8 +156,9 @@ impl Channel {
     /// abandoned, and every queued request fails with [`RequestError::Shutdown`]. A write that was
     /// already transmitted may still be applied by the server, so its outcome is indeterminate.
     ///
-    /// The task reports the terminal state to its listener before completing. Calling this more than
-    /// once, or after the task has already terminated, has no effect.
+    /// The task reports the terminal state to its listener before completing, so a
+    /// [`Listener`](crate::client::Listener) that never completes that update keeps the task alive.
+    /// Calling this more than once, or after the task has already terminated, has no effect.
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
