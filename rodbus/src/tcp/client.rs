@@ -217,7 +217,7 @@ mod tests {
     use crate::{AddressRange, RequestError, RetryStrategy, UnitId};
     use std::net::Ipv4Addr;
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
 
     /// A request timeout long enough that any test which observes a request completing before it
     /// elapses has necessarily observed cancellation rather than a timeout
@@ -450,7 +450,5 @@ mod tests {
         // the handle outlives the task it terminated
         channel.shutdown();
         assert_eq!(channel.enable().await, Err(crate::error::Shutdown));
-
-        drop(socket.write(&[]).await);
     }
 }
