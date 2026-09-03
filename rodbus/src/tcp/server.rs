@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use tracing::Instrument;
 
-use crate::common::cancellation::TaskCancellation;
+use crate::common::cancellation::ShutdownSignal;
 use crate::common::frame::{FrameWriter, FramedReader};
 use crate::common::phys::PhysLayer;
 use crate::decode::DecodeLevel;
@@ -107,7 +107,8 @@ pub(crate) struct ServerTask<T: RequestHandler> {
     decode: DecodeLevel,
     tx: tokio::sync::mpsc::Sender<SessionClose>,
     rx: tokio::sync::mpsc::Receiver<SessionClose>,
-    shutdown: TaskCancellation,
+    /// sessions are spawned, so each gets a clone to observe cancellation directly
+    shutdown: ShutdownSignal,
 }
 
 impl<T> ServerTask<T>
@@ -121,6 +122,7 @@ where
         connection_handler: TcpServerConnectionHandler,
         filter: AddressFilter,
         decode: DecodeLevel,
+        shutdown: ShutdownSignal,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
 
@@ -133,12 +135,8 @@ where
             decode,
             tx,
             rx,
-            shutdown: TaskCancellation::default(),
+            shutdown,
         }
-    }
-
-    pub(crate) fn cancellation(&self) -> TaskCancellation {
-        self.shutdown.clone()
     }
 
     async fn apply_command(&mut self, command: ServerCommand) {
@@ -158,26 +156,12 @@ where
     }
 
     pub(crate) async fn run(&mut self, mut commands: tokio::sync::mpsc::Receiver<ServerCommand>) {
-        let shutdown = self.shutdown.clone();
-        if shutdown
-            .run_until_cancelled(self.run_inner(&mut commands))
-            .await
-            .is_none()
-        {
-            tracing::info!("server shutdown requested");
-        }
-    }
-
-    async fn run_inner(&mut self, commands: &mut tokio::sync::mpsc::Receiver<ServerCommand>) {
         loop {
             tokio::select! {
                command = commands.recv() => {
                     match command {
                         Some(command) => self.apply_command(command).await,
-                        None => {
-                            tracing::info!("server shutdown");
-                            return; // shutdown signal
-                        }
+                        None => return, // the handle was dropped
                     }
                }
                shutdown = self.rx.recv() => {
@@ -222,7 +206,6 @@ where
         let connection_handler = self.connection_handler.clone();
         let handler_map = self.handlers.clone();
         let decode_level = self.decode;
-        // sessions are spawned, so they need to observe cancellation directly
         let shutdown = self.shutdown.clone();
 
         let session = async move {

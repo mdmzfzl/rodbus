@@ -50,31 +50,6 @@ impl ShutdownSignal {
     }
 }
 
-/// Cancellation signal shared by a public handle and its background task.
-///
-/// Superseded by [`pair`]; still used by the server side until it is migrated.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct TaskCancellation {
-    token: CancellationToken,
-}
-
-impl TaskCancellation {
-    pub(crate) fn cancel(&self) {
-        self.token.cancel();
-    }
-
-    pub(crate) async fn run_until_cancelled<F>(&self, operation: F) -> Option<F::Output>
-    where
-        F: Future,
-    {
-        tokio::select! {
-            biased;
-            _ = self.token.cancelled() => None,
-            result = operation => Some(result),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::future::Future;

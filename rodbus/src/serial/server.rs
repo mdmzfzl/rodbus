@@ -1,4 +1,3 @@
-use crate::common::cancellation::TaskCancellation;
 use crate::common::phys::PhysLayer;
 use crate::server::task::SessionTask;
 use crate::server::RequestHandler;
@@ -12,41 +11,13 @@ where
     pub(crate) retry: Box<dyn RetryStrategy>,
     pub(crate) settings: SerialSettings,
     pub(crate) session: SessionTask<T>,
-    shutdown: TaskCancellation,
 }
 
 impl<T> RtuServerTask<T>
 where
     T: RequestHandler,
 {
-    pub(crate) fn new(
-        port: String,
-        retry: Box<dyn RetryStrategy>,
-        settings: SerialSettings,
-        session: SessionTask<T>,
-    ) -> Self {
-        Self {
-            port,
-            retry,
-            settings,
-            session,
-            shutdown: TaskCancellation::default(),
-        }
-    }
-
-    pub(crate) fn cancellation(&self) -> TaskCancellation {
-        self.shutdown.clone()
-    }
-
     pub(crate) async fn run(&mut self) -> Shutdown {
-        let shutdown = self.shutdown.clone();
-        shutdown
-            .run_until_cancelled(self.run_inner())
-            .await
-            .unwrap_or(Shutdown)
-    }
-
-    async fn run_inner(&mut self) -> Shutdown {
         loop {
             match crate::serial::open(&self.port, self.settings) {
                 Ok(serial) => {
