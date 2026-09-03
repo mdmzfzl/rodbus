@@ -5,7 +5,7 @@ use crate::serial::SerialSettings;
 use crate::client::message::Command;
 use crate::client::task::{ClientLoop, SessionError, StateChange};
 use crate::client::{Listener, PortState, RetryStrategy};
-use crate::common::cancellation::TaskCancellation;
+use crate::common::cancellation::ShutdownSignal;
 use crate::common::frame::{FrameWriter, FramedReader};
 use crate::error::Shutdown;
 
@@ -15,7 +15,6 @@ pub(crate) struct SerialChannelTask {
     retry: Box<dyn RetryStrategy>,
     client_loop: ClientLoop,
     listener: Box<dyn Listener<PortState>>,
-    shutdown: TaskCancellation,
 }
 
 impl SerialChannelTask {
@@ -39,16 +38,10 @@ impl SerialChannelTask {
                 None,
             ),
             listener,
-            shutdown: TaskCancellation::default(),
         }
     }
 
-    pub(crate) fn cancellation(&self) -> TaskCancellation {
-        self.shutdown.clone()
-    }
-
-    pub(crate) async fn run(&mut self) -> Shutdown {
-        let shutdown = self.shutdown.clone();
+    pub(crate) async fn run(&mut self, shutdown: ShutdownSignal) -> Shutdown {
         shutdown
             .run_until_cancelled(self.run_until_shutdown())
             .await;
@@ -152,8 +145,8 @@ mod tests {
             DecodeLevel::nothing(),
             Box::new(BlockingDisabledListener { states }),
         );
-        let cancellation = task.cancellation();
-        let task = tokio::spawn(async move { task.run().await });
+        let (cancellation, signal) = crate::common::cancellation::pair();
+        let task = tokio::spawn(async move { task.run(signal).await });
 
         assert_eq!(state_rx.recv().await, Some(PortState::Disabled));
         cancellation.cancel();

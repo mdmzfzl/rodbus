@@ -405,7 +405,7 @@ mod tests {
         });
         let channel = Channel {
             tx,
-            shutdown: crate::common::cancellation::TaskCancellation::default(),
+            shutdown: crate::common::cancellation::pair().0,
         };
         (channel, join_handle, io_handle)
     }

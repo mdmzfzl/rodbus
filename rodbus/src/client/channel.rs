@@ -5,7 +5,7 @@ use crate::client::requests::read_bits::ReadBits;
 use crate::client::requests::read_registers::ReadRegisters;
 use crate::client::requests::write_multiple::{MultipleWriteRequest, WriteMultiple};
 use crate::client::requests::write_single::SingleWrite;
-use crate::common::cancellation::TaskCancellation;
+use crate::common::cancellation::{ShutdownHandle, ShutdownSignal};
 use crate::error::*;
 use crate::types::{AddressRange, BitIterator, Indexed, RegisterIterator, UnitId};
 use crate::DecodeLevel;
@@ -15,7 +15,7 @@ use crate::DecodeLevel;
 #[derive(Debug, Clone)]
 pub struct Channel {
     pub(crate) tx: tokio::sync::mpsc::Sender<Command>,
-    pub(crate) shutdown: TaskCancellation,
+    pub(crate) shutdown: ShutdownHandle,
 }
 
 /// A client channel task that has been created but not yet spawned.
@@ -29,6 +29,7 @@ pub struct Channel {
 /// caller is free to wrap [`run`](ClientTask::run) with their own instrumentation.
 pub struct ClientTask {
     inner: ClientTaskInner,
+    shutdown: ShutdownSignal,
 }
 
 enum ClientTaskInner {
@@ -38,16 +39,21 @@ enum ClientTaskInner {
 }
 
 impl ClientTask {
-    pub(crate) fn tcp(task: crate::tcp::client::TcpChannelTask) -> Self {
+    pub(crate) fn tcp(task: crate::tcp::client::TcpChannelTask, shutdown: ShutdownSignal) -> Self {
         Self {
             inner: ClientTaskInner::Tcp(task),
+            shutdown,
         }
     }
 
     #[cfg(feature = "serial")]
-    pub(crate) fn serial(task: crate::serial::client::SerialChannelTask) -> Self {
+    pub(crate) fn serial(
+        task: crate::serial::client::SerialChannelTask,
+        shutdown: ShutdownSignal,
+    ) -> Self {
         Self {
             inner: ClientTaskInner::Serial(task),
+            shutdown,
         }
     }
 
@@ -56,11 +62,11 @@ impl ClientTask {
     pub async fn run(self) {
         match self.inner {
             ClientTaskInner::Tcp(mut task) => {
-                task.run().await;
+                task.run(self.shutdown).await;
             }
             #[cfg(feature = "serial")]
             ClientTaskInner::Serial(mut task) => {
-                task.run().await;
+                task.run(self.shutdown).await;
             }
         }
     }
@@ -126,6 +132,7 @@ impl Channel {
         listener: Option<Box<dyn crate::client::Listener<crate::client::PortState>>>,
     ) -> (Self, ClientTask) {
         let (tx, rx) = tokio::sync::mpsc::channel(max_queued_requests);
+        let (shutdown, signal) = crate::common::cancellation::pair();
         let task = crate::serial::client::SerialChannelTask::new(
             path,
             serial_settings,
@@ -134,8 +141,7 @@ impl Channel {
             decode,
             listener.unwrap_or_else(|| crate::client::NullListener::create()),
         );
-        let shutdown = task.cancellation();
-        (Channel { tx, shutdown }, ClientTask::serial(task))
+        (Channel { tx, shutdown }, ClientTask::serial(task, signal))
     }
 
     /// Enable communications

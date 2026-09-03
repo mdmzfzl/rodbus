@@ -2,7 +2,57 @@ use std::future::Future;
 
 use tokio_util::sync::CancellationToken;
 
+/// Create a linked pair of shutdown handle and signal, in the spirit of an mpsc channel.
+///
+/// The [`ShutdownHandle`] goes to the public handle and can only request shutdown. The
+/// [`ShutdownSignal`] goes to the background task and can only observe that request. Neither side
+/// can do the other's job, so the direction of control is fixed by the types.
+pub(crate) fn pair() -> (ShutdownHandle, ShutdownSignal) {
+    let token = CancellationToken::new();
+    (ShutdownHandle(token.clone()), ShutdownSignal(token))
+}
+
+/// The requesting half of a shutdown [`pair`]. Cloneable so that public handles can be cloned.
+#[derive(Clone, Debug)]
+pub(crate) struct ShutdownHandle(CancellationToken);
+
+impl ShutdownHandle {
+    /// Request shutdown. Idempotent.
+    pub(crate) fn cancel(&self) {
+        self.0.cancel();
+    }
+}
+
+/// The observing half of a shutdown [`pair`].
+///
+/// Cloneable so that a task can fan the signal out to sub-tasks it spawns, but a clone can still
+/// only observe cancellation, never request it.
+#[derive(Clone, Debug)]
+pub(crate) struct ShutdownSignal(CancellationToken);
+
+impl ShutdownSignal {
+    /// Run a future until it completes or shutdown is requested.
+    ///
+    /// Cancellation takes priority. When it wins, the operation is dropped before this returns.
+    ///
+    /// `CancellationToken` has a method of the same name, deliberately not used here: it polls the
+    /// operation first, so a tie goes to the operation rather than to cancellation, and it was only
+    /// added in tokio-util 0.7.12 whereas this crate depends on `0.7`.
+    pub(crate) async fn run_until_cancelled<F>(&self, operation: F) -> Option<F::Output>
+    where
+        F: Future,
+    {
+        tokio::select! {
+            biased;
+            _ = self.0.cancelled() => None,
+            result = operation => Some(result),
+        }
+    }
+}
+
 /// Cancellation signal shared by a public handle and its background task.
+///
+/// Superseded by [`pair`]; still used by the server side until it is migrated.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TaskCancellation {
     token: CancellationToken,
@@ -13,13 +63,6 @@ impl TaskCancellation {
         self.token.cancel();
     }
 
-    /// Run a future until it completes or cancellation is requested.
-    ///
-    /// Cancellation takes priority. When it wins, the operation is dropped before this returns.
-    ///
-    /// `CancellationToken` has a method of the same name, deliberately not used here: it polls the
-    /// operation first, so a tie goes to the operation rather than to cancellation, and it was only
-    /// added in tokio-util 0.7.12 whereas this crate depends on `0.7`.
     pub(crate) async fn run_until_cancelled<F>(&self, operation: F) -> Option<F::Output>
     where
         F: Future,
@@ -62,21 +105,20 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_wins_without_polling_the_operation() {
-        let cancellation = TaskCancellation::default();
-        cancellation.cancel();
+        let (handle, signal) = pair();
+        handle.cancel();
 
-        assert_eq!(cancellation.run_until_cancelled(PanicOnPoll).await, None);
+        assert_eq!(signal.run_until_cancelled(PanicOnPoll).await, None);
     }
 
     #[tokio::test]
     async fn cancellation_drops_a_pending_operation() {
-        let cancellation = TaskCancellation::default();
-        let handle = cancellation.clone();
+        let (handle, signal) = pair();
         let dropped = Arc::new(AtomicBool::new(false));
         let flag = DropFlag(dropped.clone());
 
         let task = tokio::spawn(async move {
-            cancellation
+            signal
                 .run_until_cancelled(async move {
                     let _flag = flag;
                     std::future::pending::<()>().await;

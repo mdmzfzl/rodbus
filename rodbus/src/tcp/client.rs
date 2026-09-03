@@ -1,7 +1,7 @@
 use tracing::Instrument;
 
 use crate::client::{Channel, ClientState, ClientTask, HostAddr, Listener};
-use crate::common::cancellation::TaskCancellation;
+use crate::common::cancellation::ShutdownSignal;
 use crate::common::phys::PhysLayer;
 
 use crate::client::message::Command;
@@ -45,6 +45,7 @@ pub(crate) fn create_tcp_channel(
     options: ClientOptions,
 ) -> (Channel, ClientTask) {
     let (tx, rx) = tokio::sync::mpsc::channel(options.max_queued_requests);
+    let (shutdown, signal) = crate::common::cancellation::pair();
     let task = TcpChannelTask::new(
         host,
         rx.into(),
@@ -53,8 +54,7 @@ pub(crate) fn create_tcp_channel(
         options,
         listener,
     );
-    let shutdown = task.cancellation();
-    (Channel { tx, shutdown }, ClientTask::tcp(task))
+    (Channel { tx, shutdown }, ClientTask::tcp(task, signal))
 }
 
 pub(crate) enum TcpTaskConnectionHandler {
@@ -84,7 +84,6 @@ pub(crate) struct TcpChannelTask {
     client_loop: ClientLoop,
     listener: Box<dyn Listener<ClientState>>,
     channel_logging: ChannelLoggingMode,
-    shutdown: TaskCancellation,
 }
 
 impl TcpChannelTask {
@@ -109,17 +108,11 @@ impl TcpChannelTask {
             ),
             listener,
             channel_logging: options.channel_logging,
-            shutdown: TaskCancellation::default(),
         }
     }
 
-    pub(crate) fn cancellation(&self) -> TaskCancellation {
-        self.shutdown.clone()
-    }
-
     // runs until it is shut down
-    pub(crate) async fn run(&mut self) -> Shutdown {
-        let shutdown = self.shutdown.clone();
+    pub(crate) async fn run(&mut self, shutdown: ShutdownSignal) -> Shutdown {
         shutdown
             .run_until_cancelled(self.run_until_shutdown())
             .await;
