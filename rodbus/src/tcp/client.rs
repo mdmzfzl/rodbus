@@ -1,7 +1,6 @@
 use tracing::Instrument;
 
 use crate::client::{Channel, ClientState, ClientTask, HostAddr, Listener};
-use crate::common::cancellation::ShutdownSignal;
 use crate::common::phys::PhysLayer;
 
 use crate::client::message::Command;
@@ -111,23 +110,9 @@ impl TcpChannelTask {
         }
     }
 
-    // runs until it is shut down
-    pub(crate) async fn run(&mut self, shutdown: ShutdownSignal) -> Shutdown {
-        shutdown
-            .run_until_cancelled(self.run_until_shutdown())
-            .await;
-
-        self.client_loop.shutdown().await;
-        self.listener.update(ClientState::Shutdown).get().await;
-        Shutdown
-    }
-
-    async fn run_until_shutdown(&mut self) -> Shutdown {
+    /// Run until every handle is dropped. Cancellation is applied by the caller.
+    pub(crate) async fn run(&mut self) -> Shutdown {
         self.listener.update(ClientState::Disabled).get().await;
-        self.run_inner().await
-    }
-
-    async fn run_inner(&mut self) -> Shutdown {
         loop {
             if let Err(Shutdown) = self.client_loop.wait_for_enabled().await {
                 return Shutdown;
@@ -141,6 +126,13 @@ impl TcpChannelTask {
                 self.listener.update(ClientState::Disabled).get().await;
             }
         }
+    }
+
+    /// Fail everything still queued and report the terminal state. Called after `run` completes or
+    /// is cancelled.
+    pub(crate) async fn shutdown(&mut self) {
+        self.client_loop.shutdown().await;
+        self.listener.update(ClientState::Shutdown).get().await;
     }
 
     async fn connect(&mut self) -> Result<Result<TcpStream, std::io::Error>, StateChange> {

@@ -60,13 +60,16 @@ impl ClientTask {
     /// Run the channel task until every [`Channel`] handle is dropped or [`Channel::shutdown`] is
     /// called.
     pub async fn run(self) {
-        match self.inner {
+        let ClientTask { inner, shutdown } = self;
+        match inner {
             ClientTaskInner::Tcp(mut task) => {
-                task.run(self.shutdown).await;
+                shutdown.run_until_cancelled(task.run()).await;
+                task.shutdown().await;
             }
             #[cfg(feature = "serial")]
             ClientTaskInner::Serial(mut task) => {
-                task.run(self.shutdown).await;
+                shutdown.run_until_cancelled(task.run()).await;
+                task.shutdown().await;
             }
         }
     }

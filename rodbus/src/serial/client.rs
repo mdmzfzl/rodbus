@@ -5,7 +5,6 @@ use crate::serial::SerialSettings;
 use crate::client::message::Command;
 use crate::client::task::{ClientLoop, SessionError, StateChange};
 use crate::client::{Listener, PortState, RetryStrategy};
-use crate::common::cancellation::ShutdownSignal;
 use crate::common::frame::{FrameWriter, FramedReader};
 use crate::error::Shutdown;
 
@@ -41,22 +40,9 @@ impl SerialChannelTask {
         }
     }
 
-    pub(crate) async fn run(&mut self, shutdown: ShutdownSignal) -> Shutdown {
-        shutdown
-            .run_until_cancelled(self.run_until_shutdown())
-            .await;
-
-        self.client_loop.shutdown().await;
-        self.listener.update(PortState::Shutdown).get().await;
-        Shutdown
-    }
-
-    async fn run_until_shutdown(&mut self) -> Shutdown {
+    /// Run until every handle is dropped. Cancellation is applied by the caller.
+    pub(crate) async fn run(&mut self) -> Shutdown {
         self.listener.update(PortState::Disabled).get().await;
-        self.run_inner().await
-    }
-
-    async fn run_inner(&mut self) -> Shutdown {
         loop {
             // wait for the channel to be enabled
             if let Err(Shutdown) = self.client_loop.wait_for_enabled().await {
@@ -71,6 +57,13 @@ impl SerialChannelTask {
                 self.listener.update(PortState::Disabled).get().await;
             }
         }
+    }
+
+    /// Fail everything still queued and report the terminal state. Called after `run` completes or
+    /// is cancelled.
+    pub(crate) async fn shutdown(&mut self) {
+        self.client_loop.shutdown().await;
+        self.listener.update(PortState::Shutdown).get().await;
     }
 
     pub(crate) async fn try_open_and_run(&mut self) -> Result<(), StateChange> {
@@ -146,7 +139,10 @@ mod tests {
             Box::new(BlockingDisabledListener { states }),
         );
         let (cancellation, signal) = crate::common::cancellation::pair();
-        let task = tokio::spawn(async move { task.run(signal).await });
+        let task = tokio::spawn(async move {
+            signal.run_until_cancelled(task.run()).await;
+            task.shutdown().await
+        });
 
         assert_eq!(state_rx.recv().await, Some(PortState::Disabled));
         cancellation.cancel();
